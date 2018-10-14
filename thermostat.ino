@@ -1,85 +1,331 @@
+/*
+ * ESP32 Dev Module
+ * Niall McAndrew 8-Oct-2018
+ * 
+ * to program:
+ * hold reset, press and release other button, release reset
+ * 
+ */
+
+#include <SimpleTimer.h>
+#include "SSD1306.h"
+#include <WiFi.h>
+#include <aREST.h>
 #include <Wire.h>
- 
+#include <Math.h>
+
+SimpleTimer timer;
+SimpleTimer timerdisp;
+
 // SI7021 I2C address is 0x40(64)
-//#define si7021Addr 0x25
+#define si7021Addr 0x40
 
-int si7021Addr=0x25;
+#define sda 13
+#define scl 12
 
-#define SDA 26
-#define SCL 25
+// boiler calibration to prevent hysteresis
+#define calib 1
+
+// Create aREST instance
+aREST rest = aREST();
+
+// WiFi parameters
+const char* ssid = "TP-LINK_A005D1";
+const char* password = "137KincoraRoad";
+
+// The port to listen for incoming TCP connections
+#define LISTEN_PORT           80
+
+// Create an instance of the server
+WiFiServer server(LISTEN_PORT);
+
+// Variables to be exposed to the API
+double temperature;
+double temporig;
+double humidity;
+double humidorig;
+
+int boiler;
+int settemp = 15;
+int settemporig = 0;
+
+int bluebuttonreading;
+int redbuttonreading;
+volatile int bluestate;
+
+// Declare functions to be exposed to the API
+int ledControl(String command);
+
+#define ledpin 2  // this is the led showing boiler on/off
+#define boilerpin 14  // this is the digital pin controlling the boiler relay
+#define redbuttonpin 15
+#define bluebuttonpin 16
+
+int bluebuttonState;             // the current reading from the input pin
+int bluelastButtonState = LOW;   // the previous reading from the input pin
+
+int redbuttonState;             // the current reading from the input pin
+int redlastButtonState = LOW;   // the previous reading from the input pin
+
+// the following variables are unsigned longs because the time, measured in
+// milliseconds, will quickly become a bigger number than can be stored in an int.
+unsigned long redlastDebounceTime = 0;  // the last time the output pin was toggled
+unsigned long debounceDelay = 50;    // the debounce time; increase if the output flickers
+
+unsigned long bluelastDebounceTime = 0;  // the last time the output pin was toggled
+
+ String ipaddress;
  
 void setup()
-{
-  Wire.begin(25,26);
-  Serial.begin(9600);
-  Wire.beginTransmission(si7021Addr);
-  Wire.endTransmission();
-  delay(300);
+{ 
+  pinMode(ledpin, OUTPUT);
+  // red and blue buttons (up and down for settemp)
+  pinMode(bluebuttonpin, INPUT_PULLUP);
+  pinMode(redbuttonpin, INPUT_PULLUP);
+  pinMode(boilerpin, OUTPUT);
+
+//  attachInterrupt(bluebuttonpin, onChangeblue, CHANGE);
+//  attachInterrupt(redbuttonpin, onChangered, CHANGE);
+
+  //pinwrite(boilerpin, LOW);
+  
+   // Initialising the UI will init the display too.
+   // Initialize the OLED display using Wire library
+
+  Serial.begin(115200);
+  //Wire.beginTransmission(si7021Addr);
+  //Wire.endTransmission();
+  //delay(300);
+  
+   // Start up the library
+ Serial.begin(115200);
+
+ // every 5 seconds, call the function to read the temp/humidity
+ timer.setInterval(5000, readtemp);
+
+  // every 5 seconds, call the function to update OLED display
+ timerdisp.setInterval(500, showstatus);
+
+ rest.variable("temperature", &temperature);
+ rest.variable("humidity", &humidity);
+ rest.variable("settemp", &settemp);
+ rest.variable("boiler", &boiler);
+
+ // Function to be exposed
+  rest.function("DoSetTemp",setControl);
+
+ rest.set_id("2");
+ rest.set_name("thermostat");
+
+ // Connect to WiFi
+ WiFi.begin(ssid, password);
+ while (WiFi.status() != WL_CONNECTED) {
+   delay(500);
+   Serial.print(".");
+ }
+ Serial.println("");
+ Serial.println("WiFi connected");
+
+ // Start the server
+ server.begin();
+ Serial.println("Server started");
+
+ // Print the IP address
+ ipaddress = WiFi.localIP().toString();
+ Serial.println(ipaddress);
+
+ //Serial.println(WiFi.localIP());
+
 }
- 
-void loop()
+
+
+int checkbluebutton()
+{
+int reading = digitalRead(bluebuttonpin);
+
+  // check to see if you just pressed the button
+  // (i.e. the input went from LOW to HIGH), and you've waited long enough
+  // since the last press to ignore any noise:
+
+  // If the switch changed, due to noise or pressing:
+  if (reading != bluelastButtonState) {
+    // reset the debouncing timer
+    bluelastDebounceTime = millis();
+  }
+
+  if ((millis() - bluelastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer than the debounce
+    // delay, so take it as the actual current state:
+
+    // if the button state has changed:
+    if (reading != bluebuttonState) {
+      bluebuttonState = reading;
+
+      // only toggle the LED if the new button state is HIGH
+      if (bluebuttonState == LOW) {
+        Serial.println("Pressed blue button");
+        if (settemp > 12) {settemp = settemp - 1;}
+      }
+    }
+  }
+
+  // save the reading. Next time through the loop, it'll be the lastButtonState:
+  bluelastButtonState = reading;
+}
+
+
+int checkredbutton()
+{
+int reading = digitalRead(redbuttonpin);
+
+  // check to see if you just pressed the button
+  // (i.e. the input went from LOW to HIGH), and you've waited long enough
+  // since the last press to ignore any noise:
+
+  // If the switch changed, due to noise or pressing:
+  if (reading != redlastButtonState) {
+    // reset the debouncing timer
+    redlastDebounceTime = millis();
+  }
+
+  if ((millis() - redlastDebounceTime) > debounceDelay) {
+    // whatever the reading is at, it's been there for longer than the debounce
+    // delay, so take it as the actual current state:
+
+    // if the button state has changed:
+    if (reading != redbuttonState) {
+      redbuttonState = reading;
+
+      // only toggle the LED if the new button state is HIGH
+      if (redbuttonState == LOW) {
+        Serial.println("Pressed red button");
+        if (settemp < 23) { settemp = settemp + 1; }
+      }
+    }
+  }
+
+  // save the reading. Next time through the loop, it'll be the lastButtonState:
+  redlastButtonState = reading;
+}
+
+
+
+
+
+
+void setboiler()
+{
+  if (temperature < settemp)
+    {
+      //Serial.println("turning on boiler");
+      digitalWrite(boilerpin, HIGH);
+      digitalWrite(ledpin, HIGH);
+    }
+  if (temperature > (settemp + calib))
+      {
+      //Serial.println("turning off boiler");
+      digitalWrite(boilerpin, LOW);  
+      digitalWrite(ledpin, LOW);
+      }
+    
+  }
+
+
+// Custom function accessible by the API
+int setControl(String command) {
+
+int ret = 0;
+  // Get state from command
+  int doset = command.toInt();
+  if ((doset > 0) && (doset < 24))
+    {
+      Serial.println(String(doset));
+      settemp = doset;
+      ret = 1;
+      }
+  //digitalWrite(6,state);
+  return ret;
+}
+
+  
+void showstatus()
+{  
+
+  //if ((round(temperature) != temporig) || (round(humidity) != humidorig))
+
+  setboiler();
+
+  if ((round(temperature) != temporig) || (settemp != settemporig))
+    { 
+       settemporig = settemp;
+       temporig = round(temperature);
+       //humidorig = round(humidity);
+       
+       boiler = digitalRead(boilerpin);
+       String bstr = "On";
+       if (boiler == 0) { bstr = "Off"; }
+       
+       //Serial.print("boilerpin: ");
+       //Serial.println(boiler);
+      
+       SSD1306  display(0x3c,5, 4);         
+       display.init();
+       display.flipScreenVertically();
+       
+       display.setFont(ArialMT_Plain_10);
+       display.drawString(0, 0, "IP: " + ipaddress);
+      
+      display.setFont(ArialMT_Plain_16);
+      display.drawString(0, 15, "Temp: " +  String(int(temperature)) + " C");
+      //display.drawString(0, 30, "Humidity: " + String(int(humidity)) + "%" );
+      display.drawString(0, 30, "Set Temp: " + String(settemp) + " C");
+      display.drawString(0,45, "Boiler: " + bstr);
+      
+      display.display(); 
+      
+      Serial.println("temp:" + String(temperature));
+      Serial.println("humid:" + String(humidity));
+      Serial.println("settemp:" + String(settemp));
+      Serial.println("boiler:" + String(boiler));
+    }
+}
+
+
+
+void readtemp()
 {
 
-  byte error, address;
-  int nDevices;
- 
-  Serial.println("Scanning...");
- 
-  nDevices = 0;
-  for(address = 1; address < 127; address++ ) 
-  {
- 
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
- 
-    if (error == 0)
-    {
-      Serial.print("I2C device found at address 0x");
-      if (address<16) 
-        Serial.print("0");
-      Serial.print(address,HEX);
-      Serial.println("  !");
-      si7021Addr=address;
- 
-      nDevices++;
-    
-  
-    unsigned int data[2];
- 
+  unsigned int data[2];
+
+  Wire.begin(sda, scl);
   Wire.beginTransmission(si7021Addr);
   //Send humidity measurement command
   Wire.write(0xF5);
   Wire.endTransmission();
   delay(500);
- 
+     
   // Request 2 bytes of data
   Wire.requestFrom(si7021Addr, 2);
   // Read 2 bytes of data to get humidity
   if(Wire.available() == 2)
   {
-    Serial.print("wire.available");
     data[0] = Wire.read();
     data[1] = Wire.read();
-
-    Serial.print("data[0]: ");
-    Serial.print(data[0]);
-    Serial.print(" / data[1]: ");
-    Serial.println(data[1]);
   }
- 
+     
   // Convert the data
-  float humidity  = ((data[0] * 256.0) + data[1]);
-  humidity = ((125 * humidity) / 65536.0) - 6;
+  float humid  = ((data[0] * 256.0) + data[1]);
+  humidity = ((125 * humid) / 65536.0) - 6;
  
   Wire.beginTransmission(si7021Addr);
   // Send temperature measurement command
   Wire.write(0xF3);
   Wire.endTransmission();
   delay(500);
- 
+     
   // Request 2 bytes of data
   Wire.requestFrom(si7021Addr, 2);
- 
+   
   // Read 2 bytes of data for temperature
   if(Wire.available() == 2)
   {
@@ -89,20 +335,46 @@ void loop()
  
   // Convert the data
   float temp  = ((data[0] * 256.0) + data[1]);
-  float celsTemp = ((175.72 * temp) / 65536.0) - 46.85;
-  float fahrTemp = celsTemp * 1.8 + 32;
- 
-  // Output data to serial monitor
-  Serial.print("Humidity : ");
-  Serial.print(humidity);
-  Serial.println(" % RH");
-  Serial.print("Celsius : ");
-  Serial.print(celsTemp);
-  Serial.println(" C");
-  Serial.print("Fahrenheit : ");
-  Serial.print(fahrTemp);
-  Serial.println(" F");
-  delay(1000);
-  }
-  }
+  temperature =  ((175.72 * temp) / 65536.0) - 46.85;
+  //delay(1000);
+
+  //setboiler();
+  
+}
+void loop()
+{
+
+timer.run();
+timerdisp.run();
+
+
+pinMode(bluebuttonpin, INPUT_PULLUP);
+pinMode(redbuttonpin, INPUT_PULLUP);
+
+checkbluebutton();
+checkredbutton();
+
+//int rb = digitalRead(redbuttonpin);
+//int bb = digitalRead(bluebuttonpin);
+//Serial.println("RedButton:" + String(rb));
+//Serial.println("BlueButton:" + String(bb));
+
+//delay(1000);
+
+//setboiler();
+
+//readtemp();
+
+//showstatus();
+//delay(5000);
+
+// Handle REST calls
+ WiFiClient client = server.available();
+ if (!client) {
+   return;
+ }
+ while(!client.available()){
+   delay(1);
+ }
+ rest.handle(client);
 }
