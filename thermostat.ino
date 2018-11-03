@@ -1,6 +1,6 @@
 /*
  * ESP32 Dev Module
- * Niall McAndrew 8-Oct-2018
+ * Niall McAndrew 3-Nov-2018
  * 
  * to program:
  * hold reset, press and release other button, release reset
